@@ -1,7 +1,7 @@
 @echo on
 set PROJECT_ROOT=C:\dev\imagesearchaddon
 
-set ADDON_FOLDER=C:\Users\ghoqueir\AppData\Roaming\Anki2\addons21\imagesearchaddon
+set ADDON_FOLDER=%USERPROFILE%\AppData\Roaming\Anki2\addons21\imagesearchaddon
 if not exist %ADDON_FOLDER% mkdir %ADDON_FOLDER%
 
 set ADDON_FILE=__init__.py

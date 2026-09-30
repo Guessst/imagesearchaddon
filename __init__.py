@@ -66,24 +66,23 @@ def apply_query_regex(query: str, pattern: str) -> str:
     return match.group(1) if match.groups() else match.group(0)
 
 
-def make_search(query=DEFAULT_QUERY):
+def make_search():
     """Entry point. Wrapped so an unexpected error never hangs Anki - it's
     reported via a tooltip instead."""
     try:
-        encoded_query = quote_plus(query)
-        return _make_search(encoded_query)
+        return _make_search()
     except Exception as e:
         print(f"[ERROR] Unexpected failure in make_search: {e}")
         tooltip(f"Image Search failed unexpectedly: {e}")
         return []
 
-
-def _make_search(query):
+def _make_search():
     print("Entered: make_search")
     config = get_config()
     query_field = config["query_field"]
     insert_field = config["insert_field"]
 
+    query=DEFAULT_QUERY
     note = None
     if mw.reviewer and mw.reviewer.card:
         card = mw.reviewer.card
@@ -93,11 +92,11 @@ def _make_search(query):
         else:
             tooltip(f"Image Search: query field '{query_field}' not found on this note type. Using default query.")
 
-    query = apply_query_regex(query, config["query_regex"])
+    regexed_query = apply_query_regex(query, config["query_regex"])
 
     t_start = now_ms()
     try:
-        results = list(DDGS().images(query, max_results=8))
+        results = list(DDGS().images(regexed_query, max_results=8))
     except Exception as e:
         tooltip(f"Image Search: image search failed ({e}).")
         return []
@@ -105,7 +104,7 @@ def _make_search(query):
     print(f"Elapsed ms: {(t_end - t_start):.0f}")
 
     if not results:
-        tooltip(f"Image Search: no results found for '{query}'.")
+        tooltip(f"Image Search: no results found for '{encoded_query}'.")
         return []
 
     pairs = [

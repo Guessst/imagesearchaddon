@@ -2,16 +2,28 @@
 
 Made with [Python 3.13.15](https://www.python.org/downloads/release/python-31315/)
 
-1. Make your `.venv`
-2. Activate it
-3. 1. Run standalone
-3. 1. 1. Use `py __init__.py`
-3. 2. Run in Anki
-3. 2. 1.  Use `.\copy-to-anki.bat`
-3. 2. 2. Use `.\run-anki.bat`
+## Getting Started
 
-## make .venv
-Use `py -3.13.15 -m venv .venv`
+### 1. Set up the environment
 
-## make vendor (required for running in Anki)
-Use `pip install -r vendor-requirements.txt --target=vendor`
+```sh
+py -3.13.15 -m venv .venv
+```
+
+Then activate it:
+
+- **Windows:** `.venv\Scripts\activate`
+- **Unix/macOS:** `source .venv/bin/activate`
+
+### 2. Install vendor dependencies (required for Anki)
+
+```sh
+pip install -r vendor-requirements.txt --target=vendor
+```
+
+### 3. Run
+
+| Mode | Command |
+|------|---------|
+| In Anki (copy files) | `.\copy-to-anki.bat` |
+| In Anki (launch) | `.\run-anki.bat` |
