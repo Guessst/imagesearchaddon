@@ -1,0 +1,1 @@
+- Make Anki Config of 'field-to-use-as-query' and 'field-to-insert-in'
