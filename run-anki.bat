@@ -1,0 +1,1 @@
+call "C:\Users\ghoqueir\AppData\Local\Programs\Anki\anki-console.bat"
