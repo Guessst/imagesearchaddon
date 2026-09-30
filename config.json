@@ -1,0 +1,5 @@
+{
+    "query_field": "Word",
+    "insert_field": "Image",
+    "query_regex": "^(.*?)\\["
+}

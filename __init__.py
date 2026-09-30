@@ -1,7 +1,9 @@
 import sys
 import os
+import re
 import time
 import concurrent.futures
+from urllib.parse import quote_plus
 
 dep_dir_nam = "vendor"
 sys.path.append(
@@ -15,14 +17,19 @@ import requests
 from ddgs import DDGS
 from aqt import mw
 from aqt import gui_hooks
+from aqt.utils import tooltip
 from PyQt6.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
 from PyQt6.QtGui import QPixmap, QIcon, QImage
 from PyQt6.QtCore import QSize, QByteArray, QBuffer, QIODevice
 
 SESSION = requests.Session()
 
+DEFAULT_QUERY = "capybara"
+
+
 def now_ms():
     return time.perf_counter() * 1000
+
 
 def custom_shortcuts(state: str, shortcuts: list[tuple[str, callable]]):
     if state == "review":
@@ -30,21 +37,77 @@ def custom_shortcuts(state: str, shortcuts: list[tuple[str, callable]]):
 
 gui_hooks.state_shortcuts_will_change.append(custom_shortcuts)
 
-def make_search(query="capybara"):
+
+def get_config():
+    config = mw.addonManager.getConfig(__name__) or {}
+    return {
+        "query_field": config.get("query_field", "Front"),
+        "insert_field": config.get("insert_field", "Back"),
+        "query_regex": config.get("query_regex", ""),
+    }
+
+
+def apply_query_regex(query: str, pattern: str) -> str:
+    """Pre-process the query with a user-supplied regex, if one is configured.
+
+    If the regex has a capture group, the first group is used. Otherwise the
+    whole match is used. If the pattern is empty, invalid, or doesn't match,
+    the original query is returned unchanged.
+    """
+    if not pattern:
+        return query
+    try:
+        match = re.search(pattern, query)
+    except re.error as e:
+        tooltip(f"Image Search: invalid regex in config ({e}). Using unprocessed query.")
+        return query
+    if not match:
+        return query
+    return match.group(1) if match.groups() else match.group(0)
+
+
+def make_search(query=DEFAULT_QUERY):
+    """Entry point. Wrapped so an unexpected error never hangs Anki - it's
+    reported via a tooltip instead."""
+    try:
+        encoded_query = quote_plus(query)
+        return _make_search(encoded_query)
+    except Exception as e:
+        print(f"[ERROR] Unexpected failure in make_search: {e}")
+        tooltip(f"Image Search failed unexpectedly: {e}")
+        return []
+
+
+def _make_search(query):
     print("Entered: make_search")
+    config = get_config()
+    query_field = config["query_field"]
+    insert_field = config["insert_field"]
 
     note = None
     if mw.reviewer and mw.reviewer.card:
         card = mw.reviewer.card
         note = card.note()
-        if len(note.fields) > 0:
-            query = note.fields[0]
-    
+        if query_field in note.keys():
+            query = note[query_field]
+        else:
+            tooltip(f"Image Search: query field '{query_field}' not found on this note type. Using default query.")
+
+    query = apply_query_regex(query, config["query_regex"])
+
     t_start = now_ms()
-    results = list(DDGS().images(query, max_results=8))
+    try:
+        results = list(DDGS().images(query, max_results=8))
+    except Exception as e:
+        tooltip(f"Image Search: image search failed ({e}).")
+        return []
     t_end = now_ms()
     print(f"Elapsed ms: {(t_end - t_start):.0f}")
-    
+
+    if not results:
+        tooltip(f"Image Search: no results found for '{query}'.")
+        return []
+
     pairs = [
         (
             r.get("thumbnail"),
@@ -52,6 +115,12 @@ def make_search(query="capybara"):
         )
         for r in results
     ]
+
+    t_fetch_start = now_ms()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        thumb_urls = [p[0] for p in pairs]
+        image_bytes_list = list(executor.map(fetch_image_bytes, thumb_urls))
+    print(f"All thumbnails downloaded in {(now_ms() - t_fetch_start):.0f}ms")
 
     dialog = QDialog()
     dialog.setWindowTitle("Select Images")
@@ -61,19 +130,17 @@ def make_search(query="capybara"):
     grid = QGridLayout()
     layout.addLayout(grid)
 
-    t_fetch_start = now_ms()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        thumb_urls = [p[0] for p in pairs]
-        image_bytes_list = list(executor.map(fetch_image_bytes, thumb_urls))
-    print(f"All thumbnails downloaded in {(now_ms() - t_fetch_start):.0f}ms")
-
     buttons = []
-    for i, (img_bytes, (thumb_url, full_url)) in enumerate(zip(image_bytes_list, pairs)):
+    failed_thumbs = 0
+    for img_bytes, (thumb_url, full_url) in zip(image_bytes_list, pairs):
         if not img_bytes:
+            failed_thumbs += 1
             continue
 
         pixmap = QPixmap()
-        pixmap.loadFromData(img_bytes)
+        if not pixmap.loadFromData(img_bytes) or pixmap.isNull():
+            failed_thumbs += 1
+            continue
 
         btn = QPushButton()
         btn.setIcon(QIcon(pixmap))
@@ -82,51 +149,85 @@ def make_search(query="capybara"):
         btn.setStyleSheet("QPushButton:checked { border: 3px solid #4CAF50; background: #C8E6C9; }")
         btn.setProperty("full_url", full_url)
 
-        grid.addWidget(btn, i // 4, i % 4)
+        grid.addWidget(btn, len(buttons) // 4, len(buttons) % 4)
         buttons.append(btn)
+
+    if failed_thumbs:
+        tooltip(f"Image Search: {failed_thumbs} thumbnail(s) failed to load.")
+
+    if not buttons:
+        tooltip("Image Search: no thumbnails could be loaded.")
+        return []
 
     button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
     button_box.accepted.connect(dialog.accept)
     button_box.rejected.connect(dialog.reject)
     layout.addWidget(button_box)
 
-    if dialog.exec():
-        selected_urls = [b.property("full_url") for b in buttons if b.isChecked()]
-        
-        # Process selected images if we have an active Anki note with at least 2 fields
-        if selected_urls and note and len(note.fields) > 1:
-            print(f"Downloading {len(selected_urls)} full resolution images...")
-            t_processing_start = now_ms()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected_urls)) as executor:
-                futures = [executor.submit(download_and_convert_to_jpg, url, i) for i, url in enumerate(selected_urls)]
-                converted_images = [f.result() for f in futures]
-            
-            valid_img_tags = []
-            for filename, data in converted_images:
-                if filename and data:
-                    # Save image bytes directly to Anki's media folder
-                    actual_fname = mw.col.media.write_data(filename, data)
-                    valid_img_tags.append(f'<img src="{actual_fname}">')
+    if not dialog.exec():
+        return []
 
-            print(f"Done processing in {(now_ms() - t_processing_start):.0f}")
-            if valid_img_tags:
-                imgs_html = "<br>".join(valid_img_tags)
-                
-                # Prepend a linebreak if field[1] already contains text
-                if note.fields[1].strip():
-                    note.fields[1] += "<br>" + imgs_html
-                else:
-                    note.fields[1] = imgs_html
-                
-                # Save changes to the Anki database and refresh the current view
-                mw.col.update_note(note)
-                if mw.reviewer:
-                    mw.reviewer.show()
+    selected_urls = [b.property("full_url") for b in buttons if b.isChecked()]
 
-                print("Done processing.")
+    if selected_urls and note is not None:
+        insert_images(note, insert_field, selected_urls)
 
-        return selected_urls
-    return []
+    return selected_urls
+
+
+def insert_images(note, insert_field, selected_urls):
+    if insert_field not in note.keys():
+        tooltip(f"Image Search: insert field '{insert_field}' not found on this note type. Images were not inserted.")
+        return
+
+    print(f"Downloading {len(selected_urls)} full resolution images...")
+    t_downloading_start = now_ms()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected_urls)) as executor:
+            futures = [executor.submit(download_and_convert_to_jpg, url, i) for i, url in enumerate(selected_urls)]
+            converted_images = [f.result() for f in futures]
+    except Exception as e:
+        tooltip(f"Image Search: failed to download images ({e}).")
+        return
+    print(f"Done downloading in {(now_ms() - t_downloading_start):.0f}ms")
+
+    valid_img_tags = []
+    failed_count = 0
+    for filename, data in converted_images:
+        if not filename or not data:
+            failed_count += 1
+            continue
+        try:
+            actual_fname = mw.col.media.write_data(filename, data)
+            valid_img_tags.append(f'<img src="{actual_fname}">')
+        except Exception as e:
+            print(f"[ERROR] Failed to save media file {filename}: {e}")
+            failed_count += 1
+
+    if failed_count:
+        tooltip(f"Image Search: {failed_count} image(s) failed to download or save.")
+
+    if not valid_img_tags:
+        tooltip("Image Search: none of the selected images could be saved.")
+        return
+
+    imgs_html = "<br>".join(valid_img_tags)
+    if note[insert_field].strip():
+        note[insert_field] += "<br>" + imgs_html
+    else:
+        note[insert_field] = imgs_html
+
+    try:
+        mw.col.update_note(note)
+        if mw.reviewer:
+            mw.reviewer.show()
+    except Exception as e:
+        tooltip(f"Image Search: failed to save the note ({e}).")
+        return
+
+    print("Updated note")
+    tooltip(f"Image Search: inserted {len(valid_img_tags)} image(s).")
+
 
 def download_and_convert_to_jpg(url: str, idx: int):
     """Downloads full res image, converts to JPG at 75% quality. Safe for background threads."""
@@ -138,16 +239,17 @@ def download_and_convert_to_jpg(url: str, idx: int):
                 ba = QByteArray()
                 buf = QBuffer(ba)
                 buf.open(QIODevice.OpenModeFlag.WriteOnly)
-                
+
                 # Convert to JPG with 75% quality
                 img.save(buf, "JPG", 75)
-                
+
                 # Generate unique filename for Anki's media folder
                 filename = f"imgsearch_{int(time.time() * 1000)}_{idx}.jpg"
                 return filename, ba.data()
     except Exception as e:
         print(f"[ERROR] Failed to fetch full res {url}: {e}")
     return None, None
+
 
 def fetch_image_bytes(url: str):
     try:
@@ -157,23 +259,3 @@ def fetch_image_bytes(url: str):
     except Exception as e:
         print(f"[ERROR] Error fetching {url}: {e}")
     return None
-
-def main():
-    app = QApplication(sys.argv)
-    while True:
-        try:
-            query = input("Type your query ('quit' or 'exit' to quit): ").strip()
-            if query.lower() in ['quit', 'exit', 'q']:
-                print("Exiting...")
-                app.exit(0)
-                os._exit(0)
-            
-            make_search(query)
-
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting...")
-            app.exit(0)
-            os._exit(0)
-
-if __name__ == "__main__":
-    main()
