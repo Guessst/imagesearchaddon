@@ -1,6 +1,7 @@
 import re
 import json
 import time
+import http.cookiejar
 import urllib.parse
 import urllib.request
 
@@ -8,9 +9,18 @@ from aqt import QAction, QKeySequence, mw
 # from aqt import gui_hooks
 from aqt.utils import tooltip
 # from aqt.operations.note import update_note
-from PyQt5.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
-from PyQt5.QtGui import QPixmap, QIcon, QImage
-from PyQt5.QtCore import QSize, QByteArray, QBuffer, QIODevice
+
+from aqt.qt import qtmajor
+if qtmajor == 6:
+    from PyQt6.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
+    from PyQt6.QtGui import QPixmap, QIcon, QImage
+    from PyQt6.QtCore import QSize, QByteArray, QBuffer, QIODevice
+elif qtmajor == 5:
+    from PyQt5.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
+    from PyQt5.QtGui import QPixmap, QIcon, QImage
+    from PyQt5.QtCore import QSize, QByteArray, QBuffer, QIODevice
+else:
+    raise ImportError(f"Could not find valid Qt major version, expected (5, 6) found ({qtmajor})")
 
 DEFAULT_QUERY = "capybara"
 
@@ -29,7 +39,8 @@ HTTP_TIMEOUT_SECONDS = 15
 
 
 def http_get_bytes(url, timeout):
-    """Fetch raw bytes from a URL using only the standard library."""
+    """Fetch raw bytes from a URL using only the standard library. No
+    cookie persistence - fine for plain image/file downloads."""
     req = urllib.request.Request(url, headers=HTTP_HEADERS)
     resp = urllib.request.urlopen(req, timeout=timeout)
     try:
@@ -38,9 +49,33 @@ def http_get_bytes(url, timeout):
         resp.close()
 
 
+def build_ddg_opener():
+    """Build a urllib opener that persists cookies across requests, the
+    way requests.Session() used to do automatically. DuckDuckGo's search
+    backend expects the cookies set by the initial page load to be sent
+    back with the follow-up i.js JSON request; a bare urlopen() call per
+    request (no shared cookie jar) can get a 403 back instead."""
+    cookie_jar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+
+
+def ddg_get_bytes(opener, url, timeout, extra_headers=None):
+    """Like http_get_bytes, but goes through the given opener so cookies
+    set by earlier requests on this opener are sent along automatically."""
+    headers = dict(HTTP_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
+    resp = opener.open(req, timeout=timeout)
+    try:
+        return resp.read()
+    finally:
+        resp.close()
+
+
 # --- DuckDuckGo image search (standard library only, no 'ddgs' package) ---
 
-def fetch_vqd_token(query):
+def fetch_vqd_token(opener, query):
     """Request the DuckDuckGo search page and extract the 'vqd' session
     token required by the image search JSON endpoint."""
     print("[Image Search] Step 1: requesting DuckDuckGo page for vqd token...")
@@ -48,7 +83,7 @@ def fetch_vqd_token(query):
     token_url = "https://duckduckgo.com/?{}".format(
         urllib.parse.urlencode({"q": query})
     )
-    html = http_get_bytes(token_url, HTTP_TIMEOUT_SECONDS).decode("utf-8", errors="ignore")
+    html = ddg_get_bytes(opener, token_url, HTTP_TIMEOUT_SECONDS).decode("utf-8", errors="ignore")
 
     match = re.search(r'vqd=([\'"]?)([\d-]+)\1', html)
     if match:
@@ -63,7 +98,7 @@ def fetch_vqd_token(query):
     return vqd
 
 
-def fetch_image_results(query, vqd, max_results):
+def fetch_image_results(opener, query, vqd, max_results):
     """Fetch image results from DuckDuckGo's internal JSON endpoint."""
     print("[Image Search] Step 2: fetching image results from DuckDuckGo...")
 
@@ -78,7 +113,17 @@ def fetch_image_results(query, vqd, max_results):
     api_url = "https://duckduckgo.com/i.js?{}".format(
         urllib.parse.urlencode(api_params)
     )
-    raw_bytes = http_get_bytes(api_url, HTTP_TIMEOUT_SECONDS)
+    # A real browser reaches i.js via an XHR from the search results page,
+    # so send the same Referer and "it's an AJAX call" headers here too.
+    referer = "https://duckduckgo.com/?{}".format(
+        urllib.parse.urlencode({"q": query})
+    )
+    extra_headers = {
+        "Referer": referer,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    raw_bytes = ddg_get_bytes(opener, api_url, HTTP_TIMEOUT_SECONDS, extra_headers)
     payload = json.loads(raw_bytes.decode("utf-8"))
 
     raw_results = payload.get("results", [])
@@ -104,8 +149,9 @@ def search_duckduckgo_images(query, max_results=8):
     (title/image/thumbnail/url/width/height), using only the standard
     library under the hood.
     """
-    vqd = fetch_vqd_token(query)
-    return fetch_image_results(query, vqd, max_results)
+    opener = build_ddg_opener()
+    vqd = fetch_vqd_token(opener, query)
+    return fetch_image_results(opener, query, vqd, max_results)
 
 
 def now_ms():
@@ -239,12 +285,12 @@ def _make_search():
         tooltip("Image Search: no thumbnails could be loaded.")
         return []
 
-    button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
     button_box.accepted.connect(dialog.accept)
     button_box.rejected.connect(dialog.reject)
     layout.addWidget(button_box)
 
-    if not dialog.exec_():
+    if not dialog.exec():
         return []
 
     selected_urls = [b.property("full_url") for b in buttons if b.isChecked()]
