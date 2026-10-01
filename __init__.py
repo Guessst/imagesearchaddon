@@ -18,6 +18,7 @@ from ddgs import DDGS
 from aqt import mw
 from aqt import gui_hooks
 from aqt.utils import tooltip
+from aqt.operations.note import update_note
 from PyQt6.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
 from PyQt6.QtGui import QPixmap, QIcon, QImage
 from PyQt6.QtCore import QSize, QByteArray, QBuffer, QIODevice
@@ -104,7 +105,7 @@ def _make_search():
     print(f"Elapsed ms: {(t_end - t_start):.0f}")
 
     if not results:
-        tooltip(f"Image Search: no results found for '{encoded_query}'.")
+        tooltip(f"Image Search: no results found for '{regexed_query}'.")
         return []
 
     pairs = [
@@ -115,13 +116,14 @@ def _make_search():
         for r in results
     ]
 
+    tooltip("Image Search: Fetching images...")
     t_fetch_start = now_ms()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         thumb_urls = [p[0] for p in pairs]
         image_bytes_list = list(executor.map(fetch_image_bytes, thumb_urls))
     print(f"All thumbnails downloaded in {(now_ms() - t_fetch_start):.0f}ms")
 
-    dialog = QDialog()
+    dialog = QDialog(mw)
     dialog.setWindowTitle("Select Images")
     dialog.resize(650, 380)
 
@@ -216,13 +218,12 @@ def insert_images(note, insert_field, selected_urls):
     else:
         note[insert_field] = imgs_html
 
-    try:
-        mw.col.update_note(note)
-        if mw.reviewer:
-            mw.reviewer.show()
-    except Exception as e:
-        tooltip(f"Image Search: failed to save the note ({e}).")
-        return
+    count = len(valid_img_tags)
+    update_note(parent=mw, note=note).success(
+        lambda _: tooltip(f"Image Search: inserted {count} image(s).")
+    ).failure(
+        lambda e: tooltip(f"Image Search: failed to save the note ({e}).")
+    ).run_in_background()
 
     print("Updated note")
     tooltip(f"Image Search: inserted {len(valid_img_tags)} image(s).")
