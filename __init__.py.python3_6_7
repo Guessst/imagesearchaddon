@@ -1,0 +1,340 @@
+import re
+import json
+import time
+import urllib.parse
+import urllib.request
+
+from aqt import QAction, QKeySequence, mw
+# from aqt import gui_hooks
+from aqt.utils import tooltip
+# from aqt.operations.note import update_note
+from PyQt5.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
+from PyQt5.QtGui import QPixmap, QIcon, QImage
+from PyQt5.QtCore import QSize, QByteArray, QBuffer, QIODevice
+
+DEFAULT_QUERY = "capybara"
+
+# --- Networking (standard library only, no 'requests' / no vendored deps) --
+
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+HTTP_TIMEOUT_SECONDS = 15
+
+
+def http_get_bytes(url, timeout):
+    """Fetch raw bytes from a URL using only the standard library."""
+    req = urllib.request.Request(url, headers=HTTP_HEADERS)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    try:
+        return resp.read()
+    finally:
+        resp.close()
+
+
+# --- DuckDuckGo image search (standard library only, no 'ddgs' package) ---
+
+def fetch_vqd_token(query):
+    """Request the DuckDuckGo search page and extract the 'vqd' session
+    token required by the image search JSON endpoint."""
+    print("[Image Search] Step 1: requesting DuckDuckGo page for vqd token...")
+
+    token_url = "https://duckduckgo.com/?{}".format(
+        urllib.parse.urlencode({"q": query})
+    )
+    html = http_get_bytes(token_url, HTTP_TIMEOUT_SECONDS).decode("utf-8", errors="ignore")
+
+    match = re.search(r'vqd=([\'"]?)([\d-]+)\1', html)
+    if match:
+        vqd = match.group(2)
+    else:
+        match = re.search(r'vqd=([\w-]+)', html)
+        if not match:
+            raise RuntimeError("Failed to retrieve DuckDuckGo search token (vqd).")
+        vqd = match.group(1)
+
+    print("[Image Search]     got vqd token: {}".format(vqd))
+    return vqd
+
+
+def fetch_image_results(query, vqd, max_results):
+    """Fetch image results from DuckDuckGo's internal JSON endpoint."""
+    print("[Image Search] Step 2: fetching image results from DuckDuckGo...")
+
+    api_params = {
+        "l": "wt-wt",
+        "o": "json",
+        "q": query,
+        "vqd": vqd,
+        "f": ",,,",
+        "p": "1",
+    }
+    api_url = "https://duckduckgo.com/i.js?{}".format(
+        urllib.parse.urlencode(api_params)
+    )
+    raw_bytes = http_get_bytes(api_url, HTTP_TIMEOUT_SECONDS)
+    payload = json.loads(raw_bytes.decode("utf-8"))
+
+    raw_results = payload.get("results", [])
+    print("[Image Search]     received {} raw result(s)".format(len(raw_results)))
+
+    results = []
+    for item in raw_results[:max_results]:
+        results.append({
+            "title": item.get("title"),
+            "image": item.get("image"),
+            "thumbnail": item.get("thumbnail"),
+            "url": item.get("url"),
+            "width": item.get("width"),
+            "height": item.get("height"),
+        })
+    return results
+
+
+def search_duckduckgo_images(query, max_results=8):
+    """Drop-in replacement for DDGS().images(query, max_results=...).
+
+    Returns a list of dicts shaped the same way ddgs did
+    (title/image/thumbnail/url/width/height), using only the standard
+    library under the hood.
+    """
+    vqd = fetch_vqd_token(query)
+    return fetch_image_results(query, vqd, max_results)
+
+
+def now_ms():
+    return time.perf_counter() * 1000
+
+
+def custom_shortcuts(state, shortcuts):
+    if state == "review":
+        shortcuts.append(("Ctrl+H", make_search))
+
+# gui_hooks.state_shortcuts_will_change.append(custom_shortcuts)
+
+
+def get_config():
+    config = mw.addonManager.getConfig(__name__) or {}
+    return {
+        "query_field": config.get("query_field", "Front"),
+        "insert_field": config.get("insert_field", "Back"),
+        "query_regex": config.get("query_regex", ""),
+    }
+
+
+def apply_query_regex(query, pattern):
+    """Pre-process the query with a user-supplied regex, if one is configured.
+
+    If the regex has a capture group, the first group is used. Otherwise the
+    whole match is used. If the pattern is empty, invalid, or doesn't match,
+    the original query is returned unchanged.
+    """
+    if not pattern:
+        return query
+    try:
+        match = re.search(pattern, query)
+    except re.error as e:
+        tooltip(f"Image Search: invalid regex in config ({e}). Using unprocessed query.")
+        return query
+    if not match:
+        return query
+    return match.group(1) if match.groups() else match.group(0)
+
+
+def make_search():
+    """Entry point. Wrapped so an unexpected error never hangs Anki - it's
+    reported via a tooltip instead."""
+    try:
+        return _make_search()
+    except Exception as e:
+        print(f"[ERROR] Unexpected failure in make_search: {e}")
+        tooltip(f"Image Search failed unexpectedly: {e}")
+        return []
+
+def _make_search():
+    print("Entered: make_search")
+    config = get_config()
+    query_field = config["query_field"]
+    insert_field = config["insert_field"]
+
+    query=DEFAULT_QUERY
+    note = None
+    if mw.reviewer and mw.reviewer.card:
+        card = mw.reviewer.card
+        note = card.note()
+        if query_field in note.keys():
+            query = note[query_field]
+        else:
+            tooltip(f"Image Search: query field '{query_field}' not found on this note type. Using default query.")
+
+    regexed_query = apply_query_regex(query, config["query_regex"])
+
+    t_start = now_ms()
+    try:
+        results = search_duckduckgo_images(regexed_query, max_results=8)
+    except Exception as e:
+        tooltip(f"Image Search: image search failed ({e}).")
+        return []
+    t_end = now_ms()
+    print(f"Elapsed ms: {(t_end - t_start):.0f}")
+
+    if not results:
+        tooltip(f"Image Search: no results found for '{regexed_query}'.")
+        return []
+
+    pairs = [
+        (
+            r.get("thumbnail"),
+            r.get("image"),
+        )
+        for r in results
+    ]
+
+    tooltip("Image Search: Fetching images...")
+    t_fetch_start = now_ms()
+    thumb_urls = [p[0] for p in pairs]
+    image_bytes_list = [fetch_image_bytes(u) for u in thumb_urls]
+    print(f"All thumbnails downloaded in {(now_ms() - t_fetch_start):.0f}ms")
+
+    dialog = QDialog(mw)
+    dialog.setWindowTitle("Select Images")
+    dialog.resize(650, 380)
+
+    layout = QVBoxLayout(dialog)
+    grid = QGridLayout()
+    layout.addLayout(grid)
+
+    buttons = []
+    failed_thumbs = 0
+    for img_bytes, (thumb_url, full_url) in zip(image_bytes_list, pairs):
+        if not img_bytes:
+            failed_thumbs += 1
+            continue
+
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(img_bytes) or pixmap.isNull():
+            failed_thumbs += 1
+            continue
+
+        btn = QPushButton()
+        btn.setIcon(QIcon(pixmap))
+        btn.setIconSize(QSize(130, 130))
+        btn.setCheckable(True)
+        btn.setStyleSheet("QPushButton:checked { border: 3px solid #4CAF50; background: #C8E6C9; }")
+        btn.setProperty("full_url", full_url)
+
+        grid.addWidget(btn, len(buttons) // 4, len(buttons) % 4)
+        buttons.append(btn)
+
+    if failed_thumbs:
+        tooltip(f"Image Search: {failed_thumbs} thumbnail(s) failed to load.")
+
+    if not buttons:
+        tooltip("Image Search: no thumbnails could be loaded.")
+        return []
+
+    button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    button_box.accepted.connect(dialog.accept)
+    button_box.rejected.connect(dialog.reject)
+    layout.addWidget(button_box)
+
+    if not dialog.exec_():
+        return []
+
+    selected_urls = [b.property("full_url") for b in buttons if b.isChecked()]
+
+    if selected_urls and note is not None:
+        insert_images(note, insert_field, selected_urls)
+
+    return selected_urls
+
+
+def insert_images(note, insert_field, selected_urls):
+    if insert_field not in note.keys():
+        tooltip(f"Image Search: insert field '{insert_field}' not found on this note type. Images were not inserted.")
+        return
+
+    print(f"Downloading {len(selected_urls)} full resolution images...")
+    t_downloading_start = now_ms()
+    try:
+        converted_images = [download_and_convert_to_jpg(url, i) for i, url in enumerate(selected_urls)]
+    except Exception as e:
+        tooltip(f"Image Search: failed to download images ({e}).")
+        return
+    print(f"Done downloading in {(now_ms() - t_downloading_start):.0f}ms")
+
+    valid_img_tags = []
+    failed_count = 0
+    for filename, data in converted_images:
+        if not filename or not data:
+            failed_count += 1
+            continue
+        try:
+            actual_fname = mw.col.media.write_data(filename, data)
+            valid_img_tags.append(f'<img src="{actual_fname}">')
+        except Exception as e:
+            print(f"[ERROR] Failed to save media file {filename}: {e}")
+            failed_count += 1
+
+    if failed_count:
+        tooltip(f"Image Search: {failed_count} image(s) failed to download or save.")
+
+    if not valid_img_tags:
+        tooltip("Image Search: none of the selected images could be saved.")
+        return
+
+    imgs_html = "<br>".join(valid_img_tags)
+    if note[insert_field].strip():
+        note[insert_field] += "<br>" + imgs_html
+    else:
+        note[insert_field] = imgs_html
+
+    count = len(valid_img_tags)
+    update_note(parent=mw, note=note).success(
+        lambda _: tooltip(f"Image Search: inserted {count} image(s).")
+    ).failure(
+        lambda e: tooltip(f"Image Search: failed to save the note ({e}).")
+    ).run_in_background()
+
+    print("Updated note")
+    tooltip(f"Image Search: inserted {len(valid_img_tags)} image(s).")
+
+
+def download_and_convert_to_jpg(url, idx):
+    """Downloads full res image, converts to JPG at 75% quality. Safe for background threads."""
+    try:
+        data = http_get_bytes(url, timeout=10)
+        img = QImage.fromData(data)
+        if not img.isNull():
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QIODevice.WriteOnly)
+
+            # Convert to JPG with 75% quality
+            img.save(buf, "JPG", 75)
+
+            # Generate unique filename for Anki's media folder
+            filename = "imgsearch_{}_{}.jpg".format(int(time.time() * 1000), idx)
+            return filename, ba.data()
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch full res {url}: {e}")
+    return None, None
+
+
+def fetch_image_bytes(url):
+    try:
+        return http_get_bytes(url, timeout=6)
+    except Exception as e:
+        print(f"[ERROR] Error fetching {url}: {e}")
+    return None
+
+action = QAction(mw)
+action.triggered.connect(make_search)
+action.setShortcut(QKeySequence("Ctrl+H"))
+mw.form.menuTools.addAction(action)
