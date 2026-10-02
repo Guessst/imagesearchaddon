@@ -1,5 +1,6 @@
 {
     "query_field": "Word",
     "insert_field": "Image",
-    "query_regex": "^(.*?)\\["
+    "query_regex": "^(.*?)\\[",
+    "region_code": "jp-jp"
 }
