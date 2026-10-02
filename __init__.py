@@ -204,7 +204,7 @@ def fetch_image_results(opener, query, vqd, max_results, region_code):
     return results
 
 
-def search_duckduckgo_images(query, max_results=8, region_code="wt-wt"):
+def search_duckduckgo_images(query, region_code, max_results=8):
     opener = build_ddg_opener()
     vqd = fetch_vqd_token(opener, query)
     return fetch_image_results(opener, query, vqd, max_results, region_code)
@@ -220,7 +220,7 @@ def get_config():
         "query_field": config.get("query_field", "Front"),
         "insert_field": config.get("insert_field", "Back"),
         "query_regex": config.get("query_regex", ""),
-        "region_code": config.get("region_code", ""),
+        "region_code": config.get("region_code", "wt-wt"),
     }
 
 
@@ -323,7 +323,7 @@ def _make_search():
 
     def search_and_fetch():
         print("Querying {}".format(regexed_query))
-        results = search_duckduckgo_images(regexed_query, max_results=8, region_code=region_code)
+        results = search_duckduckgo_images(regexed_query, region_code, max_results=8)
         if not results:
             return [], [], []
 
