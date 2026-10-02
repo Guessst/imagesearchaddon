@@ -4,11 +4,16 @@ import time
 import http.cookiejar
 import urllib.parse
 import urllib.request
+import ssl
 
 from aqt import QAction, QKeySequence, mw
 # from aqt import gui_hooks
 from aqt.utils import tooltip
-# from aqt.operations.note import update_note
+
+try:
+    from aqt.operations.note import update_note
+except ImportError:
+    update_note = None
 
 from aqt.qt import qtmajor
 if qtmajor == 6:
@@ -40,13 +45,35 @@ HTTP_TIMEOUT_SECONDS = 15
 
 def http_get_bytes(url, timeout):
     """Fetch raw bytes from a URL using only the standard library. No
-    cookie persistence - fine for plain image/file downloads."""
+    cookie persistence - fine for plain image/file downloads.
+ 
+    Some third-party image hosts (typically the raw, direct "full
+    resolution" URL, as opposed to DuckDuckGo's own proxied thumbnail
+    URLs) serve an incomplete certificate chain - missing an intermediate
+    certificate. Browsers silently paper over this (by fetching the
+    missing intermediate on the fly or using a cached one); Python's ssl
+    module does not, so an otherwise-valid image download can fail with
+    CERTIFICATE_VERIFY_FAILED. If that specific failure happens, retry
+    once without certificate verification rather than losing the
+    download outright.
+    """
     req = urllib.request.Request(url, headers=HTTP_HEADERS)
-    resp = urllib.request.urlopen(req, timeout=timeout)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ssl.SSLError):
+            print("[Image Search] WARNING: cert verification failed for {}, retrying without verification...".format(url))
+            insecure_context = ssl.create_default_context()
+            insecure_context.check_hostname = False
+            insecure_context.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
+        else:
+            raise
     try:
         return resp.read()
     finally:
         resp.close()
+
 
 
 def build_ddg_opener():
@@ -103,7 +130,7 @@ def fetch_image_results(opener, query, vqd, max_results):
     print("[Image Search] Step 2: fetching image results from DuckDuckGo...")
 
     api_params = {
-        "l": "wt-wt",
+        "l": "jp-jp",
         "o": "json",
         "q": query,
         "vqd": vqd,
@@ -223,6 +250,7 @@ def _make_search():
 
     t_start = now_ms()
     try:
+        print(f"Querying {regexed_query}")
         results = search_duckduckgo_images(regexed_query, max_results=8)
     except Exception as e:
         tooltip(f"Image Search: image search failed ({e}).")
@@ -301,6 +329,27 @@ def _make_search():
     return selected_urls
 
 
+def save_note(note, count):
+    """Persist changes to `note`, show a tooltip once done, and refresh the
+    UI. Uses the modern CollectionOp-based API when available (newer Anki),
+    and falls back to the old checkpoint/flush/reset pattern on older Anki
+    builds where aqt.operations doesn't exist yet."""
+    if update_note is not None:
+        update_note(parent=mw, note=note).success(
+            lambda _: tooltip(f"Image Search: inserted {count} image(s).")
+        ).failure(
+            lambda e: tooltip(f"Image Search: failed to save the note ({e}).")
+        ).run_in_background()
+    else:
+        try:
+            mw.checkpoint("Image Search")
+            note.flush()
+            mw.reset()
+            tooltip(f"Image Search: inserted {count} image(s).")
+        except Exception as e:
+            tooltip(f"Image Search: failed to save the note ({e}).")
+ 
+
 def insert_images(note, insert_field, selected_urls):
     if insert_field not in note.keys():
         tooltip(f"Image Search: insert field '{insert_field}' not found on this note type. Images were not inserted.")
@@ -322,7 +371,13 @@ def insert_images(note, insert_field, selected_urls):
             failed_count += 1
             continue
         try:
-            actual_fname = mw.col.media.write_data(filename, data)
+            media_manager = mw.col.media
+            has_write_data_func = (getattr(media_manager, "write_data", None)) is not None
+            if has_write_data_func :
+                actual_fname = media_manager.write_data(filename, data)
+            else:
+                actual_fname = media_manager.writeData(filename, data)
+            
             valid_img_tags.append(f'<img src="{actual_fname}">')
         except Exception as e:
             print(f"[ERROR] Failed to save media file {filename}: {e}")
@@ -342,11 +397,7 @@ def insert_images(note, insert_field, selected_urls):
         note[insert_field] = imgs_html
 
     count = len(valid_img_tags)
-    update_note(parent=mw, note=note).success(
-        lambda _: tooltip(f"Image Search: inserted {count} image(s).")
-    ).failure(
-        lambda e: tooltip(f"Image Search: failed to save the note ({e}).")
-    ).run_in_background()
+    save_note(note, count)
 
     print("Updated note")
     tooltip(f"Image Search: inserted {len(valid_img_tags)} image(s).")
@@ -360,7 +411,7 @@ def download_and_convert_to_jpg(url, idx):
         if not img.isNull():
             ba = QByteArray()
             buf = QBuffer(ba)
-            buf.open(QIODevice.WriteOnly)
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
 
             # Convert to JPG with 75% quality
             img.save(buf, "JPG", 75)
