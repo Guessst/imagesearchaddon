@@ -5,9 +5,9 @@ import http.cookiejar
 import urllib.parse
 import urllib.request
 import ssl
+import threading
 
 from aqt import QAction, QKeySequence, mw
-# from aqt import gui_hooks
 from aqt.utils import tooltip
 
 try:
@@ -20,10 +20,16 @@ if qtmajor == 6:
     from PyQt6.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
     from PyQt6.QtGui import QPixmap, QIcon, QImage
     from PyQt6.QtCore import QSize, QByteArray, QBuffer, QIODevice
+    BTN_OK = QDialogButtonBox.StandardButton.Ok
+    BTN_CANCEL = QDialogButtonBox.StandardButton.Cancel
+    IO_WRITE_ONLY = QIODevice.OpenModeFlag.WriteOnly
 elif qtmajor == 5:
     from PyQt5.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
     from PyQt5.QtGui import QPixmap, QIcon, QImage
     from PyQt5.QtCore import QSize, QByteArray, QBuffer, QIODevice
+    BTN_OK = QDialogButtonBox.Ok
+    BTN_CANCEL = QDialogButtonBox.Cancel
+    IO_WRITE_ONLY = QIODevice.WriteOnly
 else:
     raise ImportError(f"Could not find valid Qt major version, expected (5, 6) found ({qtmajor})")
 
@@ -73,7 +79,6 @@ def http_get_bytes(url, timeout):
         return resp.read()
     finally:
         resp.close()
-
 
 
 def build_ddg_opener():
@@ -140,8 +145,6 @@ def fetch_image_results(opener, query, vqd, max_results):
     api_url = "https://duckduckgo.com/i.js?{}".format(
         urllib.parse.urlencode(api_params)
     )
-    # A real browser reaches i.js via an XHR from the search results page,
-    # so send the same Referer and "it's an AJAX call" headers here too.
     referer = "https://duckduckgo.com/?{}".format(
         urllib.parse.urlencode({"q": query})
     )
@@ -170,12 +173,6 @@ def fetch_image_results(opener, query, vqd, max_results):
 
 
 def search_duckduckgo_images(query, max_results=8):
-    """Drop-in replacement for DDGS().images(query, max_results=...).
-
-    Returns a list of dicts shaped the same way ddgs did
-    (title/image/thumbnail/url/width/height), using only the standard
-    library under the hood.
-    """
     opener = build_ddg_opener()
     vqd = fetch_vqd_token(opener, query)
     return fetch_image_results(opener, query, vqd, max_results)
@@ -183,13 +180,6 @@ def search_duckduckgo_images(query, max_results=8):
 
 def now_ms():
     return time.perf_counter() * 1000
-
-
-def custom_shortcuts(state, shortcuts):
-    if state == "review":
-        shortcuts.append(("Ctrl+H", make_search))
-
-# gui_hooks.state_shortcuts_will_change.append(custom_shortcuts)
 
 
 def get_config():
@@ -202,12 +192,6 @@ def get_config():
 
 
 def apply_query_regex(query, pattern):
-    """Pre-process the query with a user-supplied regex, if one is configured.
-
-    If the regex has a capture group, the first group is used. Otherwise the
-    whole match is used. If the pattern is empty, invalid, or doesn't match,
-    the original query is returned unchanged.
-    """
     if not pattern:
         return query
     try:
@@ -221,8 +205,6 @@ def apply_query_regex(query, pattern):
 
 
 def make_search():
-    """Entry point. Wrapped so an unexpected error never hangs Anki - it's
-    reported via a tooltip instead."""
     try:
         return _make_search()
     except Exception as e:
@@ -230,13 +212,14 @@ def make_search():
         tooltip(f"Image Search failed unexpectedly: {e}")
         return []
 
+
 def _make_search():
     print("Entered: make_search")
     config = get_config()
     query_field = config["query_field"]
     insert_field = config["insert_field"]
 
-    query=DEFAULT_QUERY
+    query = DEFAULT_QUERY
     note = None
     if mw.reviewer and mw.reviewer.card:
         card = mw.reviewer.card
@@ -273,7 +256,22 @@ def _make_search():
     tooltip("Image Search: Fetching images...")
     t_fetch_start = now_ms()
     thumb_urls = [p[0] for p in pairs]
-    image_bytes_list = [fetch_image_bytes(u) for u in thumb_urls]
+
+    # --- Threading: Spawn-and-join for thumbnails ---
+    image_bytes_list = [None] * len(thumb_urls)
+
+    def fetch_thumb_worker(idx, url):
+        image_bytes_list[idx] = fetch_image_bytes(url)
+
+    threads = []
+    for i, u in enumerate(thumb_urls):
+        t = threading.Thread(target=fetch_thumb_worker, args=(i, u))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
     print(f"All thumbnails downloaded in {(now_ms() - t_fetch_start):.0f}ms")
 
     dialog = QDialog(mw)
@@ -313,7 +311,7 @@ def _make_search():
         tooltip("Image Search: no thumbnails could be loaded.")
         return []
 
-    button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    button_box = QDialogButtonBox(BTN_OK | BTN_CANCEL)
     button_box.accepted.connect(dialog.accept)
     button_box.rejected.connect(dialog.reject)
     layout.addWidget(button_box)
@@ -330,10 +328,6 @@ def _make_search():
 
 
 def save_note(note, count):
-    """Persist changes to `note`, show a tooltip once done, and refresh the
-    UI. Uses the modern CollectionOp-based API when available (newer Anki),
-    and falls back to the old checkpoint/flush/reset pattern on older Anki
-    builds where aqt.operations doesn't exist yet."""
     if update_note is not None:
         update_note(parent=mw, note=note).success(
             lambda _: tooltip(f"Image Search: inserted {count} image(s).")
@@ -348,7 +342,7 @@ def save_note(note, count):
             tooltip(f"Image Search: inserted {count} image(s).")
         except Exception as e:
             tooltip(f"Image Search: failed to save the note ({e}).")
- 
+
 
 def insert_images(note, insert_field, selected_urls):
     if insert_field not in note.keys():
@@ -357,27 +351,46 @@ def insert_images(note, insert_field, selected_urls):
 
     print(f"Downloading {len(selected_urls)} full resolution images...")
     t_downloading_start = now_ms()
+
+    # --- Threading: Spawn-and-join for full images & JPG conversion ---
+    converted_images = [None] * len(selected_urls)
+
+    def download_convert_worker(idx, url):
+        converted_images[idx] = download_and_convert_to_jpg(url, idx)
+
     try:
-        converted_images = [download_and_convert_to_jpg(url, i) for i, url in enumerate(selected_urls)]
+        threads = []
+        for i, url in enumerate(selected_urls):
+            t = threading.Thread(target=download_convert_worker, args=(i, url))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
     except Exception as e:
         tooltip(f"Image Search: failed to download images ({e}).")
         return
+
     print(f"Done downloading in {(now_ms() - t_downloading_start):.0f}ms")
 
     valid_img_tags = []
     failed_count = 0
-    for filename, data in converted_images:
+    for item in converted_images:
+        if not item:
+            failed_count += 1
+            continue
+        filename, data = item
         if not filename or not data:
             failed_count += 1
             continue
         try:
             media_manager = mw.col.media
             has_write_data_func = (getattr(media_manager, "write_data", None)) is not None
-            if has_write_data_func :
+            if has_write_data_func:
                 actual_fname = media_manager.write_data(filename, data)
             else:
                 actual_fname = media_manager.writeData(filename, data)
-            
+
             valid_img_tags.append(f'<img src="{actual_fname}">')
         except Exception as e:
             print(f"[ERROR] Failed to save media file {filename}: {e}")
@@ -411,7 +424,7 @@ def download_and_convert_to_jpg(url, idx):
         if not img.isNull():
             ba = QByteArray()
             buf = QBuffer(ba)
-            buf.open(QIODevice.OpenModeFlag.WriteOnly)
+            buf.open(IO_WRITE_ONLY)
 
             # Convert to JPG with 75% quality
             img.save(buf, "JPG", 75)
@@ -430,6 +443,7 @@ def fetch_image_bytes(url):
     except Exception as e:
         print(f"[ERROR] Error fetching {url}: {e}")
     return None
+
 
 action = QAction(mw)
 action.triggered.connect(make_search)
