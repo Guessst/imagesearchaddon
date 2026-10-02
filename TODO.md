@@ -1,4 +1,6 @@
-- Support multiple image search engines
 - Support customizing number of results
-- Make DEV flag togglable in config
+- Refactor for better maintainability and testing
+- Make DEV flag that is togglable in config
+- Testing
+- Support multiple image search engines
 - Maybe use the aqt things for Qt functionality instead of the Qt itself
