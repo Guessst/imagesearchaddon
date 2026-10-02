@@ -1,1 +1,2 @@
-- Make Anki Config of 'field-to-use-as-query' and 'field-to-insert-in'
+- Make DEV flag togglable in config
+- Maybe use the aqt things for Qt functionality instead of the Qt itself

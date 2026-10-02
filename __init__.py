@@ -1,42 +1,217 @@
-import sys
-import os
 import re
+import json
 import time
-import concurrent.futures
-from urllib.parse import quote_plus
+import http.client
+import http.cookiejar
+import urllib.parse
+import urllib.request
+import urllib.error
+import ssl
+import socket
+import threading
 
-dep_dir_nam = "vendor"
-sys.path.append(
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        dep_dir_nam
-    )
-)
-
-import requests
-from ddgs import DDGS
-from aqt import mw
-from aqt import gui_hooks
+from aqt import QAction, QKeySequence, mw
 from aqt.utils import tooltip
-from aqt.operations.note import update_note
-from PyQt6.QtWidgets import QApplication, QWidget, QDialog, QGridLayout, QPushButton, QVBoxLayout, QDialogButtonBox
-from PyQt6.QtGui import QPixmap, QIcon, QImage
-from PyQt6.QtCore import QSize, QByteArray, QBuffer, QIODevice
 
-SESSION = requests.Session()
+try:
+    from aqt.operations.note import update_note
+except ImportError:
+    update_note = None
+
+from aqt.qt import qtmajor
+if qtmajor == 6:
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QDialog, QGridLayout, QPushButton,
+        QVBoxLayout, QDialogButtonBox, QProgressDialog, QMessageBox
+    )
+    from PyQt6.QtGui import QPixmap, QIcon, QImage
+    from PyQt6.QtCore import QSize, QByteArray, QBuffer, QIODevice, Qt
+    BTN_OK = QDialogButtonBox.StandardButton.Ok
+    BTN_CANCEL = QDialogButtonBox.StandardButton.Cancel
+    IO_WRITE_ONLY = QIODevice.OpenModeFlag.WriteOnly
+    APP_MODAL = Qt.WindowModality.ApplicationModal
+elif qtmajor == 5:
+    from PyQt5.QtWidgets import (
+        QApplication, QWidget, QDialog, QGridLayout, QPushButton,
+        QVBoxLayout, QDialogButtonBox, QProgressDialog, QMessageBox
+    )
+    from PyQt5.QtGui import QPixmap, QIcon, QImage
+    from PyQt5.QtCore import QSize, QByteArray, QBuffer, QIODevice, Qt
+    BTN_OK = QDialogButtonBox.Ok
+    BTN_CANCEL = QDialogButtonBox.Cancel
+    IO_WRITE_ONLY = QIODevice.WriteOnly
+    APP_MODAL = Qt.ApplicationModal
+else:
+    raise ImportError("Could not find valid Qt major version, expected (5, 6) found ({})".format(qtmajor))
 
 DEFAULT_QUERY = "capybara"
+
+# --- Networking (standard library only) ---
+
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+HTTP_TIMEOUT_SECONDS = 15
+
+NETWORK_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    socket.timeout,
+    ssl.SSLError,
+    OSError,
+)
+
+
+def dialog_exec(dialog):
+    """Executes a QDialog safely across PyQt5 (.exec_()) and PyQt6 (.exec())."""
+    if qtmajor == 6:
+        return dialog.exec()
+    return dialog.exec_()
+
+
+def http_get_bytes(url, timeout):
+    """Fetch raw bytes from a URL using only standard library modules.
+    Catches timeouts, disconnects, HTTP errors, and handles SSL chain retries."""
+    if not url:
+        return None
+    req = urllib.request.Request(url, headers=HTTP_HEADERS)
+    resp = None
+    try:
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, ssl.SSLError):
+                print("[Image Search] WARNING: cert verification failed for {}, retrying without verification...".format(url))
+                insecure_context = ssl.create_default_context()
+                insecure_context.check_hostname = False
+                insecure_context.verify_mode = ssl.CERT_NONE
+                resp = urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
+            else:
+                raise
+        except ssl.SSLError:
+            print("[Image Search] WARNING: SSL error for {}, retrying without verification...".format(url))
+            insecure_context = ssl.create_default_context()
+            insecure_context.check_hostname = False
+            insecure_context.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
+
+        return resp.read()
+    except NETWORK_ERRORS as e:
+        print("[Image Search] Network failure fetching {}: {}".format(url, e))
+        return None
+    except Exception as e:
+        print("[Image Search] Unexpected error fetching {}: {}".format(url, e))
+        return None
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+def build_ddg_opener():
+    cookie_jar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+
+
+def ddg_get_bytes(opener, url, timeout, extra_headers=None):
+    headers = dict(HTTP_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
+    resp = None
+    try:
+        resp = opener.open(req, timeout=timeout)
+        return resp.read()
+    except NETWORK_ERRORS as e:
+        raise RuntimeError("DuckDuckGo request failed for {}: {}".format(url, e))
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+# --- DuckDuckGo image search ---
+
+def fetch_vqd_token(opener, query):
+    print("[Image Search] Step 1: requesting DuckDuckGo page for vqd token...")
+    token_url = "https://duckduckgo.com/?{}".format(
+        urllib.parse.urlencode({"q": query})
+    )
+    raw_bytes = ddg_get_bytes(opener, token_url, HTTP_TIMEOUT_SECONDS)
+    html = raw_bytes.decode("utf-8", errors="ignore")
+
+    match = re.search(r'vqd=([\'"]?)([\d-]+)\1', html)
+    if match:
+        vqd = match.group(2)
+    else:
+        match = re.search(r'vqd=([\w-]+)', html)
+        if not match:
+            raise RuntimeError("Failed to retrieve DuckDuckGo search token (vqd).")
+        vqd = match.group(1)
+
+    print("[Image Search]     got vqd token: {}".format(vqd))
+    return vqd
+
+
+def fetch_image_results(opener, query, vqd, max_results, region_code):
+    print("[Image Search] Step 2: fetching image results from DuckDuckGo...")
+    api_params = {
+        "l": region_code,
+        "o": "json",
+        "q": query,
+        "vqd": vqd,
+        "f": ",,,",
+        "p": "1",
+    }
+    print("api_params::", api_params)
+    api_url = "https://duckduckgo.com/i.js?{}".format(
+        urllib.parse.urlencode(api_params)
+    )
+    referer = "https://duckduckgo.com/?{}".format(
+        urllib.parse.urlencode({"q": query})
+    )
+    extra_headers = {
+        "Referer": referer,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    raw_bytes = ddg_get_bytes(opener, api_url, HTTP_TIMEOUT_SECONDS, extra_headers)
+    payload = json.loads(raw_bytes.decode("utf-8"))
+
+    raw_results = payload.get("results", [])
+    print("[Image Search]     received {} raw result(s)".format(len(raw_results)))
+
+    results = []
+    for item in raw_results[:max_results]:
+        results.append({
+            "title": item.get("title"),
+            "image": item.get("image"),
+            "thumbnail": item.get("thumbnail"),
+            "url": item.get("url"),
+            "width": item.get("width"),
+            "height": item.get("height"),
+        })
+    return results
+
+
+def search_duckduckgo_images(query, max_results=8, region_code="wt-wt"):
+    opener = build_ddg_opener()
+    vqd = fetch_vqd_token(opener, query)
+    return fetch_image_results(opener, query, vqd, max_results, region_code)
 
 
 def now_ms():
     return time.perf_counter() * 1000
-
-
-def custom_shortcuts(state: str, shortcuts: list[tuple[str, callable]]):
-    if state == "review":
-        shortcuts.append(("Ctrl+H", make_search))
-
-gui_hooks.state_shortcuts_will_change.append(custom_shortcuts)
 
 
 def get_config():
@@ -45,45 +220,96 @@ def get_config():
         "query_field": config.get("query_field", "Front"),
         "insert_field": config.get("insert_field", "Back"),
         "query_regex": config.get("query_regex", ""),
+        "region_code": config.get("region_code", ""),
     }
 
 
-def apply_query_regex(query: str, pattern: str) -> str:
-    """Pre-process the query with a user-supplied regex, if one is configured.
-
-    If the regex has a capture group, the first group is used. Otherwise the
-    whole match is used. If the pattern is empty, invalid, or doesn't match,
-    the original query is returned unchanged.
-    """
+def apply_query_regex(query, pattern):
     if not pattern:
         return query
     try:
         match = re.search(pattern, query)
     except re.error as e:
-        tooltip(f"Image Search: invalid regex in config ({e}). Using unprocessed query.")
+        tooltip("Image Search: invalid regex in config ({}). Using unprocessed query.".format(e))
         return query
     if not match:
         return query
     return match.group(1) if match.groups() else match.group(0)
 
 
+# --- Thread & GUI Unblocking Runner ---
+
+def run_with_progress(task_fn, label_text, parent=None):
+    """Runs task_fn in a background thread while keeping Qt event loop alive.
+    Returns (result, cancelled_bool)."""
+    container = {"result": None, "error": None, "done": False}
+
+    def worker():
+        try:
+            container["result"] = task_fn()
+        except Exception as e:
+            container["error"] = e
+        finally:
+            container["done"] = True
+
+    t = threading.Thread(target=worker)
+    t.daemon = True
+    t.start()
+
+    progress = QProgressDialog(label_text, "Cancel", 0, 0, parent or mw)
+    progress.setWindowTitle("Image Search")
+    progress.setWindowModality(APP_MODAL)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.setMinimumDuration(0)
+    progress.show()
+
+    user_cancelled = False
+    while not container["done"]:
+        QApplication.processEvents()
+        if progress.wasCanceled():
+            user_cancelled = True
+            break
+        time.sleep(0.02)
+
+    progress.reset()
+    progress.hide()
+
+    if user_cancelled:
+        return None, True
+
+    if container["error"]:
+        raise container["error"]
+
+    return container["result"], False
+
+
 def make_search():
-    """Entry point. Wrapped so an unexpected error never hangs Anki - it's
-    reported via a tooltip instead."""
     try:
         return _make_search()
     except Exception as e:
-        print(f"[ERROR] Unexpected failure in make_search: {e}")
-        tooltip(f"Image Search failed unexpectedly: {e}")
+        print("[ERROR] Unexpected failure in make_search: {}".format(e))
+        tooltip("Image Search failed unexpectedly: {}".format(e))
         return []
+
 
 def _make_search():
     print("Entered: make_search")
+
+    if getattr(mw, "state", None) != "review" or not mw.reviewer or not mw.reviewer.card:
+        QMessageBox.warning(
+            mw,
+            "Image Search",
+            "You must be currently reviewing a card to search for images."
+        )
+        return []
+
     config = get_config()
     query_field = config["query_field"]
     insert_field = config["insert_field"]
+    region_code = config["region_code"]
 
-    query=DEFAULT_QUERY
+    query = DEFAULT_QUERY
     note = None
     if mw.reviewer and mw.reviewer.card:
         card = mw.reviewer.card
@@ -91,38 +317,58 @@ def _make_search():
         if query_field in note.keys():
             query = note[query_field]
         else:
-            tooltip(f"Image Search: query field '{query_field}' not found on this note type. Using default query.")
+            tooltip("Image Search: query field '{}' not found on this note type. Using default query.".format(query_field))
 
     regexed_query = apply_query_regex(query, config["query_regex"])
 
+    def search_and_fetch():
+        print("Querying {}".format(regexed_query))
+        results = search_duckduckgo_images(regexed_query, max_results=8, region_code=region_code)
+        if not results:
+            return [], [], []
+
+        pairs = [(r.get("thumbnail"), r.get("image")) for r in results]
+        thumb_urls = [p[0] for p in pairs]
+        image_bytes_list = [None] * len(thumb_urls)
+
+        def fetch_thumb_worker(idx, url):
+            image_bytes_list[idx] = fetch_image_bytes(url)
+
+        threads = []
+        for i, u in enumerate(thumb_urls):
+            t = threading.Thread(target=fetch_thumb_worker, args=(i, u))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        return results, pairs, image_bytes_list
+
     t_start = now_ms()
     try:
-        results = list(DDGS().images(regexed_query, max_results=8))
-    except Exception as e:
-        tooltip(f"Image Search: image search failed ({e}).")
-        return []
-    t_end = now_ms()
-    print(f"Elapsed ms: {(t_end - t_start):.0f}")
-
-    if not results:
-        tooltip(f"Image Search: no results found for '{regexed_query}'.")
-        return []
-
-    pairs = [
-        (
-            r.get("thumbnail"),
-            r.get("image"),
+        search_data, cancelled = run_with_progress(
+            search_and_fetch,
+            "Searching images...",
+            mw
         )
-        for r in results
-    ]
+    except Exception as e:
+        tooltip("Image Search: image search failed ({}).".format(e))
+        return []
 
-    tooltip("Image Search: Fetching images...")
-    t_fetch_start = now_ms()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        thumb_urls = [p[0] for p in pairs]
-        image_bytes_list = list(executor.map(fetch_image_bytes, thumb_urls))
-    print(f"All thumbnails downloaded in {(now_ms() - t_fetch_start):.0f}ms")
+    if cancelled:
+        return []
 
+    t_end = now_ms()
+    print("Search & thumbnails elapsed ms: {:.0f}".format(t_end - t_start))
+
+    if not search_data or not search_data[0]:
+        tooltip("Image Search: no results found for '{}'.".format(regexed_query))
+        return []
+
+    results, pairs, image_bytes_list = search_data
+
+    # UI Construction on Main Thread
     dialog = QDialog(mw)
     dialog.setWindowTitle("Select Images")
     dialog.resize(650, 380)
@@ -154,18 +400,18 @@ def _make_search():
         buttons.append(btn)
 
     if failed_thumbs:
-        tooltip(f"Image Search: {failed_thumbs} thumbnail(s) failed to load.")
+        tooltip("Image Search: {} thumbnail(s) failed to load.".format(failed_thumbs))
 
     if not buttons:
         tooltip("Image Search: no thumbnails could be loaded.")
         return []
 
-    button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    button_box = QDialogButtonBox(BTN_OK | BTN_CANCEL)
     button_box.accepted.connect(dialog.accept)
     button_box.rejected.connect(dialog.reject)
     layout.addWidget(button_box)
 
-    if not dialog.exec():
+    if not dialog_exec(dialog):
         return []
 
     selected_urls = [b.property("full_url") for b in buttons if b.isChecked()]
@@ -176,37 +422,88 @@ def _make_search():
     return selected_urls
 
 
+def save_note(note, count):
+    if update_note is not None:
+        update_note(parent=mw, note=note).success(
+            lambda _: tooltip("Image Search: inserted {} image(s).".format(count))
+        ).failure(
+            lambda e: tooltip("Image Search: failed to save the note ({}).".format(e))
+        ).run_in_background()
+    else:
+        try:
+            mw.checkpoint("Image Search")
+            note.flush()
+            mw.reset()
+            tooltip("Image Search: inserted {} image(s).".format(count))
+        except Exception as e:
+            tooltip("Image Search: failed to save the note ({}).".format(e))
+
+
 def insert_images(note, insert_field, selected_urls):
     if insert_field not in note.keys():
-        tooltip(f"Image Search: insert field '{insert_field}' not found on this note type. Images were not inserted.")
+        tooltip("Image Search: insert field '{}' not found on this note type. Images were not inserted.".format(insert_field))
         return
 
-    print(f"Downloading {len(selected_urls)} full resolution images...")
+    print("Downloading {} full resolution images...".format(len(selected_urls)))
+
+    def download_all_images():
+        converted = [None] * len(selected_urls)
+
+        def download_convert_worker(idx, url):
+            converted[idx] = download_and_convert_to_jpg(url, idx)
+
+        threads = []
+        for i, url in enumerate(selected_urls):
+            t = threading.Thread(target=download_convert_worker, args=(i, url))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        return converted
+
     t_downloading_start = now_ms()
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected_urls)) as executor:
-            futures = [executor.submit(download_and_convert_to_jpg, url, i) for i, url in enumerate(selected_urls)]
-            converted_images = [f.result() for f in futures]
+        converted_images, cancelled = run_with_progress(
+            download_all_images,
+            "Downloading {} selected image(s)...".format(len(selected_urls)),
+            mw
+        )
     except Exception as e:
-        tooltip(f"Image Search: failed to download images ({e}).")
+        tooltip("Image Search: failed to download images ({}).".format(e))
         return
-    print(f"Done downloading in {(now_ms() - t_downloading_start):.0f}ms")
+
+    if cancelled or not converted_images:
+        return
+
+    print("Done downloading in {:.0f}ms".format(now_ms() - t_downloading_start))
 
     valid_img_tags = []
     failed_count = 0
-    for filename, data in converted_images:
+    for item in converted_images:
+        if not item:
+            failed_count += 1
+            continue
+        filename, data = item
         if not filename or not data:
             failed_count += 1
             continue
         try:
-            actual_fname = mw.col.media.write_data(filename, data)
-            valid_img_tags.append(f'<img src="{actual_fname}">')
+            media_manager = mw.col.media
+            has_write_data_func = (getattr(media_manager, "write_data", None)) is not None
+            if has_write_data_func:
+                actual_fname = media_manager.write_data(filename, data)
+            else:
+                actual_fname = media_manager.writeData(filename, data)
+
+            valid_img_tags.append('<img src="{}">'.format(actual_fname))
         except Exception as e:
-            print(f"[ERROR] Failed to save media file {filename}: {e}")
+            print("[ERROR] Failed to save media file {}: {}".format(filename, e))
             failed_count += 1
 
     if failed_count:
-        tooltip(f"Image Search: {failed_count} image(s) failed to download or save.")
+        tooltip("Image Search: {} image(s) failed to download or save.".format(failed_count))
 
     if not valid_img_tags:
         tooltip("Image Search: none of the selected images could be saved.")
@@ -219,43 +516,37 @@ def insert_images(note, insert_field, selected_urls):
         note[insert_field] = imgs_html
 
     count = len(valid_img_tags)
-    update_note(parent=mw, note=note).success(
-        lambda _: tooltip(f"Image Search: inserted {count} image(s).")
-    ).failure(
-        lambda e: tooltip(f"Image Search: failed to save the note ({e}).")
-    ).run_in_background()
+    save_note(note, count)
 
     print("Updated note")
-    tooltip(f"Image Search: inserted {len(valid_img_tags)} image(s).")
 
 
-def download_and_convert_to_jpg(url: str, idx: int):
-    """Downloads full res image, converts to JPG at 75% quality. Safe for background threads."""
+def download_and_convert_to_jpg(url, idx):
+    """Downloads full res image, converts to JPG at 75% quality. Thread-safe."""
     try:
-        resp = SESSION.get(url, timeout=10)
-        if resp.status_code == 200:
-            img = QImage.fromData(resp.content)
-            if not img.isNull():
-                ba = QByteArray()
-                buf = QBuffer(ba)
-                buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        data = http_get_bytes(url, timeout=10)
+        if not data:
+            return None, None
+        img = QImage.fromData(data)
+        if not img.isNull():
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(IO_WRITE_ONLY)
 
-                # Convert to JPG with 75% quality
-                img.save(buf, "JPG", 75)
-
-                # Generate unique filename for Anki's media folder
-                filename = f"imgsearch_{int(time.time() * 1000)}_{idx}.jpg"
-                return filename, ba.data()
+            img.save(buf, "JPG", 75)
+            buf.close()
+            filename = "imgsearch_{}_{}.jpg".format(int(time.time() * 1000), idx)
+            return filename, bytes(ba.data())
     except Exception as e:
-        print(f"[ERROR] Failed to fetch full res {url}: {e}")
+        print("[ERROR] Failed to process full res image {}: {}".format(url, e))
     return None, None
 
 
-def fetch_image_bytes(url: str):
-    try:
-        resp = SESSION.get(url, timeout=6)
-        if resp.status_code == 200:
-            return resp.content
-    except Exception as e:
-        print(f"[ERROR] Error fetching {url}: {e}")
-    return None
+def fetch_image_bytes(url):
+    return http_get_bytes(url, timeout=6)
+
+
+action = QAction("Search Images...", mw)
+action.triggered.connect(make_search)
+action.setShortcut(QKeySequence("Ctrl+H"))
+mw.form.menuTools.addAction(action)
